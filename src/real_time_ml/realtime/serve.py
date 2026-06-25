@@ -37,14 +37,19 @@ def serve(config: ProjectConfig, max_cycles: int | None = None) -> dict[str, Any
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     destination = (config.get("realtime.python_send_host"), int(config.get("realtime.python_to_unity_port")))
     lsl_inlet = None
-    lsl_offset = 0.0
+    lsl_unix_offset = 0.0
+    lsl_time_correction = 0.0
     try:
         import pylsl
 
         streams = pylsl.resolve_byprop("type", config.get("streams.physio_type"), timeout=1.0)
         if streams:
             lsl_inlet = pylsl.StreamInlet(streams[0], max_buflen=30)
-            lsl_offset = time.time() - pylsl.local_clock()
+            lsl_unix_offset = time.time() - pylsl.local_clock()
+            try:
+                lsl_time_correction = float(lsl_inlet.time_correction(timeout=1.0))
+            except Exception:
+                lsl_time_correction = 0.0
     except Exception:
         lsl_inlet = None
     clock = TenSecondCycleClock()
@@ -83,7 +88,7 @@ def serve(config: ProjectConfig, max_cycles: int | None = None) -> dict[str, Any
             if lsl_inlet is not None:
                 chunk, timestamps = lsl_inlet.pull_chunk(timeout=0.0, max_samples=1024)
                 for sample, timestamp in zip(chunk, timestamps):
-                    unix_ms = int((timestamp + lsl_offset) * 1000)
+                    unix_ms = int((timestamp + lsl_time_correction + lsl_unix_offset) * 1000)
                     physio_buffer.add(unix_ms, sample)
                     last_seen["lsl"] = unix_ms
             for cycle_index, start_ms, end_ms in clock.ready_windows(now_ms):

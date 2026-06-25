@@ -94,7 +94,12 @@ rtml train-policy
 rtml evaluate
 rtml replay
 rtml serve
+rtml adaptive-model list
+rtml adaptive-model verify --bundle classical_condition_current
+rtml adaptive-control
 ```
+
+Adaptive Control 本地闭环推荐直接双击项目根目录的 `launch-adaptive-control.cmd`；它会先验证默认模型，再以 `rtml adaptive-control` 启动本机服务。Unity 侧只使用 `Adaptive Control > Configure` 与 `Adaptive Control > Control Panel`。正式开始前先启动 EEG/ECG LSL、戴好头显并确认 head/eye tracking，然后在控制面板点击 `Check Readiness`；只有 Python、EEG/ECG、head tracking、eye tracking 全部通过后，`Start Control` 才会启用。启动后面板会显示当前 10 秒特征窗口的倒计时。
 
 `train-video-relaxation-ml` 与 `train-videomae2-relaxation` 是仅预测 relaxation 的离线研究对照；它们复用现有手工视频特征和冻结 VideoMAE2 嵌入，产物只写入 `artifacts/video/relaxation_only/`。该路径不预测 discomfort、不训练风险分类器，不能用于 `serve`、推荐策略或视频 Shadow replay。
 

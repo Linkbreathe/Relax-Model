@@ -74,6 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the single reports/<run_id>_summary_zh.md from this run's metrics and predictions",
     )
     commands.add_parser("train-state")
+    commands.add_parser(
+        "train-realtime-multimodal-window",
+        help="train the adaptive-control realtime EEG/ECG/eye/HMD-motion window model",
+    )
     commands.add_parser("train-dcnn-state")
     commands.add_parser("train-policy")
     commands.add_parser("evaluate")
@@ -86,6 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
     video_replay.add_argument("--output", type=Path)
     serve_parser = commands.add_parser("serve")
     serve_parser.add_argument("--max-cycles", type=int, help="test-only finite cycle count")
+    adaptive_control = commands.add_parser("adaptive-control", help="start the local adaptive-control service")
+    adaptive_control.add_argument("--control-config", help="adaptive-control.yaml path")
+    adaptive_control.add_argument("--bundle", help="registered adaptive-control model bundle id")
+    adaptive_control.add_argument("--max-cycles", type=int, help="test-only finite cycle count")
+    adaptive_model = commands.add_parser("adaptive-model", help="inspect or verify registered adaptive-control model bundles")
+    adaptive_model.add_argument("--control-config", help="adaptive-control.yaml path")
+    adaptive_model.add_argument("action", choices=("list", "verify"))
+    adaptive_model.add_argument("--bundle", help="bundle id; required for verify")
     run_all = commands.add_parser("run-all")
     run_all.add_argument("--participants", help="comma-separated participant ids")
     run_all.add_argument("--no-video", action="store_true")
@@ -196,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
         from real_time_ml.training import train_state
 
         result = train_state(config)
+    elif args.command == "train-realtime-multimodal-window":
+        from real_time_ml.training import train_realtime_multimodal_window_model
+
+        result = train_realtime_multimodal_window_model(config)
     elif args.command == "train-dcnn-state":
         from real_time_ml.training import train_dcnn_state
 
@@ -220,6 +236,45 @@ def main(argv: list[str] | None = None) -> int:
         from real_time_ml.realtime.serve import serve
 
         result = serve(config, args.max_cycles)
+    elif args.command == "adaptive-control":
+        from real_time_ml.adaptive_control.service import serve_adaptive_control
+        from real_time_ml.adaptive_control.settings import load_adaptive_control_settings
+
+        control_settings = load_adaptive_control_settings(args.control_config)
+        try:
+            result = serve_adaptive_control(
+                config,
+                control_settings,
+                bundle_id=args.bundle,
+                max_cycles=args.max_cycles,
+            )
+        except OSError as exc:
+            _print({
+                "ok": False,
+                "error": "adaptive_control_startup_failed",
+                "reason": str(exc),
+                "listen_host": control_settings.listen_host,
+                "unity_to_python_port": control_settings.unity_to_python_port,
+                "python_send_host": control_settings.python_send_host,
+                "python_to_unity_port": control_settings.python_to_unity_port,
+            })
+            return 2
+    elif args.command == "adaptive-model":
+        from real_time_ml.adaptive_control.service import list_models, verify_model
+        from real_time_ml.adaptive_control.settings import load_adaptive_control_settings
+
+        settings = load_adaptive_control_settings(args.control_config)
+        if args.action == "list":
+            result = {"models": list_models(settings)}
+        else:
+            if not args.bundle:
+                parser.error(f"{args.command} verify requires --bundle")
+            report = verify_model(settings, args.bundle)
+            result = {
+                "compatible": report.compatible,
+                "reasons": report.reasons,
+                "descriptor": report.descriptor.__dict__,
+            }
     elif args.command == "run-all":
         from real_time_ml.data.index import build_index
         from real_time_ml.features.extract import extract_features
