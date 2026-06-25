@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Bundle = "classical_condition_current",
+    [string]$Bundle = "realtime_multimodal_window_v1",
     [switch]$SkipModelCheck
 )
 

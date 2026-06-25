@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import numpy as np
+import yaml
 
 from real_time_ml.adaptive_control.contracts import AdaptiveReadinessSnapshot, ControlProfile, json_bytes
 from real_time_ml.adaptive_control.models import RealtimeMultimodalWindowAdapter
@@ -105,6 +107,369 @@ def test_adaptive_control_policy_failsafe_only_at_extreme_discomfort(tmp_path):
     assert decision.reasons == ["extreme_predicted_discomfort"]
 
 
+def test_adaptive_control_policy_explores_after_calm_dwell(tmp_path):
+    profile = _profile(tmp_path)
+    policy = AdaptiveControlPolicy(
+        profile,
+        relaxation_weight=0.85,
+        discomfort_weight=-0.15,
+        hysteresis=0.002,
+        extreme_discomfort_limit=0.95,
+        calm_exploration_dwell_windows=3,
+        calm_exploration_penalty_per_window=0.025,
+        calm_exploration_penalty_max=0.12,
+    )
+    adapter = StubAdapter(
+        _estimate(0.78, 0.00),
+        {
+            "C2": _estimate(0.70, 0.03),
+            "C4": _estimate(0.64, 0.02),
+        },
+    )
+
+    decision = policy.decide(
+        adapter,
+        {},
+        "C1",
+        {"eeg": 1.0, "ecg": 1.0, "head": 1.0, "eye": 1.0},
+        dwell_windows=6,
+    )
+
+    assert decision.action == "apply"
+    assert decision.target_condition == "C2"
+    assert decision.reasons == ["calm_dwell_exploration"]
+    assert decision.candidate_utilities["C1"] < 0.60
+
+
+def test_stochastic_policy_routes_high_discomfort_to_safe_pool(tmp_path):
+    profile = _profile(tmp_path)
+    policy = AdaptiveControlPolicy(
+        profile,
+        relaxation_weight=0.85,
+        discomfort_weight=-0.15,
+        hysteresis=0.002,
+        extreme_discomfort_limit=0.95,
+        stochastic_exploration_enabled=True,
+        exploration_candidate_scope="all",
+        exploration_random_seed=3,
+        safety_discomfort_min=0.50,
+        safety_conditions=["C1", "C2", "C4", "C5"],
+    )
+    adapter = StubAdapter(
+        _estimate(0.45, 0.60),
+        {
+            "C1": _estimate(0.55, 0.30),
+            "C2": _estimate(0.56, 0.28),
+            "C4": _estimate(0.54, 0.26),
+            "C5": _estimate(0.57, 0.32),
+        },
+    )
+
+    decision = policy.decide(
+        adapter,
+        {},
+        "C9",
+        {"eeg": 1.0, "ecg": 1.0, "head": 1.0, "eye": 1.0},
+        condition_history=["C9", "C9", "C9"],
+    )
+
+    assert decision.action == "apply"
+    assert decision.target_condition in {"C1", "C2", "C4", "C5"}
+    assert decision.reasons == ["safety_recovery_stochastic"]
+
+
+def test_stochastic_policy_respects_high_load_cooldown(tmp_path):
+    profile = _profile(tmp_path)
+    policy = AdaptiveControlPolicy(
+        profile,
+        relaxation_weight=0.85,
+        discomfort_weight=-0.15,
+        hysteresis=0.002,
+        extreme_discomfort_limit=0.95,
+        stochastic_exploration_enabled=True,
+        exploration_candidate_scope="all",
+        exploration_random_seed=1,
+        calm_exploration_dwell_windows=3,
+        high_load_conditions=["C9"],
+        high_load_penalty=0.0,
+    )
+    adapter = StubAdapter(
+        _estimate(0.80, 0.05),
+        {
+            "C1": _estimate(0.55, 0.20),
+            "C2": _estimate(0.56, 0.20),
+            "C3": _estimate(0.57, 0.20),
+            "C4": _estimate(0.58, 0.20),
+            "C5": _estimate(0.59, 0.20),
+            "C7": _estimate(0.60, 0.20),
+            "C8": _estimate(0.61, 0.20),
+            "C9": _estimate(0.99, 0.00),
+        },
+    )
+
+    decision = policy.decide(
+        adapter,
+        {},
+        "C6",
+        {"eeg": 1.0, "ecg": 1.0, "head": 1.0, "eye": 1.0},
+        dwell_windows=3,
+        condition_history=["C9", "C6", "C6", "C6"],
+        condition_cooldowns={"C9": 4},
+    )
+
+    assert decision.action == "apply"
+    assert decision.target_condition != "C9"
+    assert decision.reasons == ["stochastic_calm_exploration"]
+
+
+def test_sensor_conditioning_downweights_high_load_when_aroused(tmp_path):
+    profile = _profile(tmp_path)
+    policy = AdaptiveControlPolicy(
+        profile,
+        relaxation_weight=0.85,
+        discomfort_weight=-0.15,
+        hysteresis=0.002,
+        extreme_discomfort_limit=0.95,
+        stochastic_exploration_enabled=True,
+        exploration_candidate_scope="all",
+        exploration_random_seed=2,
+        calm_exploration_dwell_windows=3,
+        recent_history_penalty=0.0,
+        high_load_penalty=0.0,
+        sensor_conditioning_enabled=True,
+    )
+    adapter = StubAdapter(
+        _estimate(0.70, 0.10),
+        {
+            "C1": _estimate(0.60, 0.10),
+            "C2": _estimate(0.60, 0.10),
+            "C3": _estimate(0.60, 0.10),
+            "C4": _estimate(0.60, 0.10),
+            "C6": _estimate(0.60, 0.10),
+            "C7": _estimate(0.60, 0.10),
+            "C8": _estimate(0.60, 0.10),
+            "C9": _estimate(0.60, 0.10),
+        },
+    )
+
+    decision = policy.decide(
+        adapter,
+        {
+            "ecg_hr_bpm": 150.0,
+            "ecg_hrv_30s_rmssd_ms": 50.0,
+            "eye_angular_velocity_deg_s_mean": 24.0,
+            "eye_saccade_fraction_ivt": 0.08,
+            "head_speed_mean": 0.06,
+            "head_angular_speed_deg_s_mean": 25.0,
+            "head_stationary_fraction": 0.10,
+            "eeg_alpha_beta_ratio": 0.20,
+            "eeg_theta_beta_ratio": 2.50,
+        },
+        "C5",
+        {"eeg": 1.0, "ecg": 1.0, "head": 1.0, "eye": 1.0},
+        dwell_windows=3,
+        condition_history=["C5", "C5", "C5"],
+    )
+
+    assert decision.action == "apply"
+    assert decision.candidate_utilities["C1"] > decision.candidate_utilities["C9"]
+    assert decision.candidate_utilities["C2"] > decision.candidate_utilities["C9"]
+    assert policy.sensor_state(
+        {
+            "ecg_hr_bpm": 150.0,
+            "eye_angular_velocity_deg_s_mean": 24.0,
+            "head_speed_mean": 0.06,
+            "eeg_theta_beta_ratio": 2.50,
+        },
+        _estimate(0.70, 0.10),
+    )["physiological_arousal"] >= 0.9
+
+
+def test_stochastic_policy_forces_change_at_max_dwell(tmp_path):
+    profile = _profile(tmp_path)
+    policy = AdaptiveControlPolicy(
+        profile,
+        relaxation_weight=0.85,
+        discomfort_weight=-0.15,
+        hysteresis=0.002,
+        extreme_discomfort_limit=0.95,
+        stochastic_exploration_enabled=True,
+        exploration_candidate_scope="all",
+        exploration_random_seed=4,
+        min_condition_dwell_windows=0,
+        max_condition_dwell_windows=4,
+    )
+    adapter = StubAdapter(
+        _estimate(0.90, 0.02),
+        {
+            "C1": _estimate(0.50, 0.20),
+            "C2": _estimate(0.50, 0.20),
+            "C3": _estimate(0.50, 0.20),
+            "C4": _estimate(0.50, 0.20),
+            "C6": _estimate(0.50, 0.20),
+            "C7": _estimate(0.50, 0.20),
+            "C8": _estimate(0.50, 0.20),
+            "C9": _estimate(0.50, 0.20),
+        },
+    )
+
+    decision = policy.decide(
+        adapter,
+        {},
+        "C5",
+        {"eeg": 1.0, "ecg": 1.0, "head": 1.0, "eye": 1.0},
+        dwell_windows=4,
+        condition_history=["C5", "C5", "C5", "C5"],
+    )
+
+    assert decision.action == "apply"
+    assert decision.target_condition != "C5"
+    assert decision.reasons == ["stochastic_max_dwell_exploration"]
+
+
+def test_switch_probability_allows_one_window_change_when_aroused(tmp_path):
+    profile = _profile(tmp_path)
+    policy = AdaptiveControlPolicy(
+        profile,
+        relaxation_weight=0.85,
+        discomfort_weight=-0.15,
+        hysteresis=0.002,
+        extreme_discomfort_limit=0.95,
+        stochastic_exploration_enabled=True,
+        exploration_candidate_scope="all",
+        exploration_random_seed=1,
+        sensor_conditioning_enabled=True,
+        switch_probability_enabled=True,
+        switch_probability_after_windows=[0.10, 0.45, 0.85],
+        switch_probability_force_after_windows=3,
+        high_load_penalty=0.0,
+        recent_history_penalty=0.0,
+    )
+    adapter = StubAdapter(
+        _estimate(0.70, 0.10),
+        {
+            "C1": _estimate(0.60, 0.10),
+            "C2": _estimate(0.60, 0.10),
+            "C3": _estimate(0.60, 0.10),
+            "C4": _estimate(0.60, 0.10),
+            "C6": _estimate(0.60, 0.10),
+            "C7": _estimate(0.60, 0.10),
+            "C8": _estimate(0.60, 0.10),
+            "C9": _estimate(0.60, 0.10),
+        },
+    )
+
+    decision = policy.decide(
+        adapter,
+        {
+            "ecg_hr_bpm": 150.0,
+            "eye_angular_velocity_deg_s_mean": 24.0,
+            "head_speed_mean": 0.06,
+            "eeg_theta_beta_ratio": 2.50,
+        },
+        "C5",
+        {"eeg": 1.0, "ecg": 1.0, "head": 1.0, "eye": 1.0},
+        dwell_windows=0,
+        condition_history=["C5"],
+    )
+
+    assert decision.action == "apply"
+    assert decision.reasons == ["sensor_probability_exploration"]
+    assert decision.estimate is not None
+    assert decision.estimate.raw["controller_switch_probability"] > 0.10
+
+
+def test_switch_probability_can_hold_stable_calm_after_one_window(tmp_path):
+    profile = _profile(tmp_path)
+    policy = AdaptiveControlPolicy(
+        profile,
+        relaxation_weight=0.85,
+        discomfort_weight=-0.15,
+        hysteresis=0.002,
+        extreme_discomfort_limit=0.95,
+        stochastic_exploration_enabled=True,
+        exploration_candidate_scope="all",
+        exploration_random_seed=1,
+        sensor_conditioning_enabled=True,
+        switch_probability_enabled=True,
+        switch_probability_after_windows=[0.10, 0.45, 0.85],
+        switch_probability_force_after_windows=3,
+    )
+    adapter = StubAdapter(_estimate(0.70, 0.05), {})
+
+    decision = policy.decide(
+        adapter,
+        {
+            "ecg_hr_bpm": 78.0,
+            "ecg_hrv_30s_rmssd_ms": 260.0,
+            "eye_angular_velocity_deg_s_mean": 5.0,
+            "head_speed_mean": 0.010,
+            "head_stationary_fraction": 0.50,
+            "eeg_alpha_beta_ratio": 0.55,
+            "eeg_theta_beta_ratio": 0.45,
+        },
+        "C5",
+        {"eeg": 1.0, "ecg": 1.0, "head": 1.0, "eye": 1.0},
+        dwell_windows=0,
+        condition_history=["C5"],
+    )
+
+    assert decision.action == "hold"
+    assert decision.reasons == ["sensor_probability_hold"]
+    assert decision.estimate is not None
+    assert decision.estimate.raw["controller_switch_probability"] < 0.10
+
+
+def test_switch_probability_forces_change_on_third_window(tmp_path):
+    profile = _profile(tmp_path)
+    policy = AdaptiveControlPolicy(
+        profile,
+        relaxation_weight=0.85,
+        discomfort_weight=-0.15,
+        hysteresis=0.002,
+        extreme_discomfort_limit=0.95,
+        stochastic_exploration_enabled=True,
+        exploration_candidate_scope="all",
+        exploration_random_seed=20,
+        sensor_conditioning_enabled=True,
+        switch_probability_enabled=True,
+        switch_probability_after_windows=[0.10, 0.45, 0.85],
+        switch_probability_force_after_windows=3,
+    )
+    adapter = StubAdapter(
+        _estimate(0.70, 0.05),
+        {
+            "C1": _estimate(0.60, 0.10),
+            "C2": _estimate(0.60, 0.10),
+            "C3": _estimate(0.60, 0.10),
+            "C4": _estimate(0.60, 0.10),
+            "C6": _estimate(0.60, 0.10),
+            "C7": _estimate(0.60, 0.10),
+            "C8": _estimate(0.60, 0.10),
+            "C9": _estimate(0.60, 0.10),
+        },
+    )
+
+    decision = policy.decide(
+        adapter,
+        {
+            "ecg_hr_bpm": 78.0,
+            "eye_angular_velocity_deg_s_mean": 5.0,
+            "head_speed_mean": 0.010,
+            "head_stationary_fraction": 0.50,
+        },
+        "C5",
+        {"eeg": 1.0, "ecg": 1.0, "head": 1.0, "eye": 1.0},
+        dwell_windows=2,
+        condition_history=["C5", "C5", "C5"],
+    )
+
+    assert decision.action == "apply"
+    assert decision.reasons == ["sensor_probability_force_exploration"]
+    assert decision.estimate is not None
+    assert decision.estimate.raw["controller_switch_probability"] == 1.0
+
+
 def test_adaptive_control_has_a_clear_primary_command():
     args = build_parser().parse_args(["adaptive-control"])
 
@@ -115,6 +480,14 @@ def test_realtime_multimodal_command_is_available():
     args = build_parser().parse_args(["train-realtime-multimodal-window"])
 
     assert args.command == "train-realtime-multimodal-window"
+
+
+def test_launcher_uses_configured_default_bundle():
+    root = Path(__file__).resolve().parents[1]
+    settings = yaml.safe_load((root / "configs" / "adaptive-control.yaml").read_text(encoding="utf-8"))
+    launcher = (root / "start-adaptive-control.ps1").read_text(encoding="utf-8")
+
+    assert f'[string]$Bundle = "{settings["models"]["default_bundle"]}"' in launcher
 
 
 def test_realtime_multimodal_feature_filter_excludes_condition_context():

@@ -96,6 +96,34 @@ class AdaptiveControlRuntime:
             discomfort_weight=settings.utility_discomfort_weight,
             hysteresis=settings.utility_hysteresis,
             extreme_discomfort_limit=settings.extreme_discomfort_limit,
+            calm_exploration_dwell_windows=settings.calm_exploration_dwell_windows,
+            calm_exploration_penalty_per_window=settings.calm_exploration_penalty_per_window,
+            calm_exploration_penalty_max=settings.calm_exploration_penalty_max,
+            calm_exploration_relaxation_min=settings.calm_exploration_relaxation_min,
+            calm_exploration_discomfort_max=settings.calm_exploration_discomfort_max,
+            stochastic_exploration_enabled=settings.stochastic_exploration_enabled,
+            exploration_candidate_scope=settings.exploration_candidate_scope,
+            exploration_random_seed=settings.exploration_random_seed,
+            exploration_temperature=settings.exploration_temperature,
+            exploration_random_floor=settings.exploration_random_floor,
+            sensor_conditioning_enabled=settings.sensor_conditioning_enabled,
+            sensor_conditioning_weight=settings.sensor_conditioning_weight,
+            switch_probability_enabled=settings.switch_probability_enabled,
+            switch_probability_after_windows=settings.switch_probability_after_windows,
+            switch_probability_force_after_windows=settings.switch_probability_force_after_windows,
+            switch_probability_boredom_weight=settings.switch_probability_boredom_weight,
+            switch_probability_arousal_weight=settings.switch_probability_arousal_weight,
+            switch_probability_discomfort_weight=settings.switch_probability_discomfort_weight,
+            switch_probability_stable_calm_weight=settings.switch_probability_stable_calm_weight,
+            safety_discomfort_min=settings.safety_discomfort_min,
+            safety_conditions=settings.safety_conditions,
+            min_condition_dwell_windows=settings.min_condition_dwell_windows,
+            max_condition_dwell_windows=settings.max_condition_dwell_windows,
+            recent_history_window=settings.recent_history_window,
+            recent_history_penalty=settings.recent_history_penalty,
+            high_load_conditions=settings.high_load_conditions,
+            high_load_penalty=settings.high_load_penalty,
+            high_load_cooldown_windows=settings.high_load_cooldown_windows,
         )
         self.session_id: str | None = None
         self.participant_id: str | None = None
@@ -108,6 +136,9 @@ class AdaptiveControlRuntime:
             "lsl": None, "unity": None, "ack": None, "eeg": None, "ecg": None, "head": None, "eye": None
         }
         self.low_modality_windows = 0
+        self.condition_dwell_windows = 0
+        self.condition_history = [self.current_condition]
+        self.condition_cooldowns: dict[str, int] = {}
         self.locked_failsafe = False
         self.headset_presence_available = False
         self.headset_worn = False
@@ -136,6 +167,9 @@ class AdaptiveControlRuntime:
                 "lsl": None, "unity": None, "ack": None, "eeg": None, "ecg": None, "head": None, "eye": None
             }
             self.low_modality_windows = 0
+            self.condition_dwell_windows = 0
+            self.condition_history = [self.current_condition]
+            self.condition_cooldowns = {}
             self.locked_failsafe = False
             self.headset_presence_available = False
             self.headset_worn = False
@@ -151,6 +185,30 @@ class AdaptiveControlRuntime:
             })
             return True
         return False
+
+    def remember_condition(self, condition: str) -> None:
+        self.condition_history.append(condition)
+        keep = max(
+            16,
+            self.settings.recent_history_window * 4,
+            self.settings.high_load_cooldown_windows + 4,
+        )
+        self.condition_history = self.condition_history[-keep:]
+
+    def update_condition_memory(self, decision: ControlDecision) -> None:
+        for condition, remaining in list(self.condition_cooldowns.items()):
+            next_remaining = max(0, remaining - 1)
+            if next_remaining:
+                self.condition_cooldowns[condition] = next_remaining
+            else:
+                self.condition_cooldowns.pop(condition, None)
+        observed = decision.target_condition if decision.action == "apply" else decision.current_condition
+        self.remember_condition(observed)
+        if decision.action == "apply" and observed in set(self.settings.high_load_conditions):
+            self.condition_cooldowns[observed] = max(
+                self.condition_cooldowns.get(observed, 0),
+                self.settings.high_load_cooldown_windows,
+            )
 
     def log(self, name: str, payload: dict[str, Any]) -> None:
         if self._logs_dir is not None:
@@ -455,6 +513,8 @@ def serve_adaptive_control(
                     if incoming_condition != runtime.current_condition:
                         if clock.condition_event(incoming_condition, timestamp):
                             runtime.current_condition = incoming_condition
+                            runtime.condition_dwell_windows = 0
+                            runtime.remember_condition(incoming_condition)
                             physio_buffer.clear()
                             head_buffer.clear()
                             eye_buffer.clear()
@@ -519,7 +579,15 @@ def serve_adaptive_control(
                     else:
                         runtime.low_modality_windows = 0
                         try:
-                            decision = runtime.policy.decide(runtime.adapter, features, runtime.current_condition, coverage)
+                            decision = runtime.policy.decide(
+                                runtime.adapter,
+                                features,
+                                runtime.current_condition,
+                                coverage,
+                                dwell_windows=runtime.condition_dwell_windows,
+                                condition_history=runtime.condition_history,
+                                condition_cooldowns=runtime.condition_cooldowns,
+                            )
                             runtime.runtime_state = "Warmup" if cycle_index == 0 else "Running"
                             if decision.action == "failsafe":
                                 runtime.runtime_state = "Failsafe"
@@ -531,11 +599,19 @@ def serve_adaptive_control(
                     command = runtime.make_command(command_cycle_index, now_ms, decision)
                     runtime.last_decision = decision
                     runtime.last_command = command
+                    if decision.estimate is not None and decision.target_condition == runtime.current_condition:
+                        runtime.condition_dwell_windows += 1
+                    else:
+                        runtime.condition_dwell_windows = 0
+                    runtime.update_condition_memory(decision)
                     payload = command.to_dict()
                     sender.sendto(json_bytes(payload), destination)
                     runtime.log("decisions.jsonl", {
                         "window_start_ms": start_ms, "window_end_ms": end_ms, "coverage": coverage,
                         "qc": qc, "features": features, "decision": payload,
+                        "condition_dwell_windows": runtime.condition_dwell_windows,
+                        "condition_history": runtime.condition_history,
+                        "condition_cooldowns": runtime.condition_cooldowns,
                         "prediction_source": decision.estimate.raw.get("prediction_source") if decision.estimate else None,
                         "modalities_used": decision.estimate.active_modalities if decision.estimate else [],
                         "model_diagnostics": decision.estimate.raw if decision.estimate else {},
