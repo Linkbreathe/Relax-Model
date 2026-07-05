@@ -30,7 +30,8 @@ def eye_features(rows: list[dict[str, float]], velocity_threshold_deg_s: float =
     features["eye_direction_dispersion_deg"] = float(np.mean(dispersion))
     histogram, _, _ = np.histogram2d(gaze[:, 0], gaze[:, 1], bins=8)
     features["eye_spatial_entropy"] = spectral_entropy(histogram.ravel())
-    painting = [row.get("gaze_on_painting") for row in valid if np.isfinite(row.get("gaze_on_painting", np.nan))]
-    features["eye_gaze_on_painting_fraction"] = float(np.mean(painting)) if painting else float("nan")
+    # gaze_on_painting is never populated at collection, so eye_gaze_on_painting_fraction was a
+    # constant (0 variance across all windows) dead feature; it is no longer emitted. Restore it
+    # only after fixing gaze_on_painting capture/export upstream.
     coverage = min(valid_fraction, (time_s[-1] - time_s[0]) / 10.0)
     return features, {"eye_coverage": float(coverage), "eye_usable": bool(coverage >= 0.6)}

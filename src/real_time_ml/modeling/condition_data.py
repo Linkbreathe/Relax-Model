@@ -83,21 +83,23 @@ def aggregate_window_frame(window_frame):
             prefix = f"{column}__"
             record[prefix + "missing_ratio"] = float(1.0 - valid.size / len(values))
             if valid.size == 0:
-                for statistic in ("mean", "std", "min", "max", "range", "median", "first", "last", "delta", "slope"):
+                for statistic in ("mean", "std", "min", "max", "median", "first", "last", "slope"):
                     record[prefix + statistic] = float("nan")
                 continue
             record[prefix + "mean"] = float(np.mean(valid))
             record[prefix + "std"] = float(np.std(valid, ddof=0))
             record[prefix + "min"] = float(np.min(valid))
             record[prefix + "max"] = float(np.max(valid))
-            record[prefix + "range"] = float(np.max(valid) - np.min(valid))
             record[prefix + "median"] = float(np.median(valid))
             first = next((value for value in values if np.isfinite(value)), float("nan"))
             last = next((value for value in values[::-1] if np.isfinite(value)), float("nan"))
             record[prefix + "first"] = float(first)
             record[prefix + "last"] = float(last)
-            record[prefix + "delta"] = float(last - first)
             record[prefix + "slope"] = _slope(values)
+            # range (=max-min) and delta (=last-first) are dropped: exact linear combinations of
+            # retained stats, so redundant for the linear candidates. Removing them cuts ~19% of
+            # condition-level features and leaves the LOPO deployability verdict unchanged; the
+            # residual metric differences stay within the n=15 noise band (see feature-pruning report).
         records.append(record)
     output = pd.DataFrame(records).sort_values(["participant_id", "presentation_position"]).reset_index(drop=True)
     keys = output[["participant_id", "condition"]]
@@ -157,11 +159,9 @@ def aggregate_realtime_history(
                 prefix + "std": float(np.std(valid)),
                 prefix + "min": float(np.min(valid)),
                 prefix + "max": float(np.max(valid)),
-                prefix + "range": float(np.max(valid) - np.min(valid)),
                 prefix + "median": float(np.median(valid)),
                 prefix + "first": float(valid[0]),
                 prefix + "last": float(valid[-1]),
-                prefix + "delta": float(valid[-1] - valid[0]),
                 prefix + "slope": _slope(values),
             })
     output["window_count"] = float(len(records))

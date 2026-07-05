@@ -130,12 +130,13 @@ def extract_features(
     participants: list[str] | None = None,
     include_video: bool | None = None,
     output_dir: Path | None = None,
+    windows_path: Path | None = None,
 ) -> dict[str, Any]:
     selected = participants or config.participants
-    windows_path = config.path("preprocessed") / "windows.csv"
-    if not windows_path.exists():
+    source_windows_path = windows_path or (config.path("preprocessed") / "windows.csv")
+    if windows_path is None and not source_windows_path.exists():
         preprocess(config, selected)
-    windows = [row for row in read_rows(windows_path) if row["participant_id"] in set(selected)]
+    windows = [row for row in read_rows(source_windows_path) if row["participant_id"] in set(selected)]
     source_by_participant = {row["participant_id"]: row for row in build_index(config, selected)}
     video_enabled = bool(config.get("features.video.enabled")) if include_video is None else include_video
     output: list[dict[str, Any]] = []

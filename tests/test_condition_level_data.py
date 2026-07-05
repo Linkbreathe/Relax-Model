@@ -6,6 +6,8 @@ import pytest
 
 from real_time_ml.config import load_config
 from real_time_ml.modeling.condition_data import aggregate_window_frame, build_condition_dataset
+from real_time_ml.modeling.condition_train import _feature_columns
+from real_time_ml.modeling.groups import columns_for_group
 from real_time_ml.modeling.safety import deployment_guard
 
 
@@ -24,11 +26,12 @@ def test_window_features_become_one_condition_label_with_full_summary_statistics
     assert row["head_speed_mean__mean"] == 3.0
     assert row["head_speed_mean__min"] == 1.0
     assert row["head_speed_mean__max"] == 5.0
-    assert row["head_speed_mean__range"] == 4.0
     assert row["head_speed_mean__first"] == 1.0
     assert row["head_speed_mean__last"] == 5.0
-    assert row["head_speed_mean__delta"] == 4.0
     assert abs(row["head_speed_mean__missing_ratio"] - 1 / 3) < 1e-12
+    # range (=max-min) and delta (=last-first) are no longer emitted; keep the removal enforced.
+    assert "head_speed_mean__range" not in aggregated.columns
+    assert "head_speed_mean__delta" not in aggregated.columns
 
 
 def test_deployment_guard_for_condition_level_requires_ranking_and_risk_recall():
@@ -42,6 +45,35 @@ def test_deployment_guard_for_condition_level_requires_ranking_and_risk_recall()
     deployable, reasons = deployment_guard(metrics)
     assert not deployable
     assert reasons == ["condition_level_discomfort_gate_failed"]
+
+
+def test_untrusted_ecg_hrv_features_are_excluded_from_model_columns():
+    columns = [
+        "ecg_hr_bpm",
+        "ecg_rr_median_ms",
+        "ecg_hrv_30s_rmssd_ms",
+        "ecg_hrv_30s_rmssd_ms__mean",
+        "ecg_hrv_300s_sdnn_ms",
+        "ecg_rr_std_ms_audit_only",
+        "ecg_rr_std_ms_audit_only__mean",
+        "head_speed_mean",
+        "eeg_t7_alpha_relative",
+    ]
+    assert columns_for_group(columns, "no_eeg") == [
+        "ecg_hr_bpm",
+        "ecg_rr_median_ms",
+        "head_speed_mean",
+    ]
+
+    frame = pd.DataFrame([{name: 1.0 for name in columns}])
+    selected = _feature_columns(frame)
+    assert "ecg_hr_bpm" in selected
+    assert "ecg_rr_median_ms" in selected
+    assert "ecg_hrv_30s_rmssd_ms" not in selected
+    assert "ecg_hrv_30s_rmssd_ms__mean" not in selected
+    assert "ecg_hrv_300s_sdnn_ms" not in selected
+    assert "ecg_rr_std_ms_audit_only" not in selected
+    assert "ecg_rr_std_ms_audit_only__mean" not in selected
 
 
 @pytest.mark.integration

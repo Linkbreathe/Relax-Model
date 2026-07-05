@@ -17,6 +17,7 @@ from real_time_ml.modeling.condition_models import (
     make_regression_pipeline,
     make_risk_pipeline,
 )
+from real_time_ml.modeling.groups import is_model_feature_allowed
 from real_time_ml.utils import write_json
 
 
@@ -46,6 +47,8 @@ def _feature_columns(frame) -> list[str]:
     columns = []
     for name in frame.columns:
         if name in STATIC_COLUMNS or name in {"window_count", "window_count_expected"}:
+            continue
+        if not is_model_feature_allowed(name):
             continue
         converted = __import__("pandas").to_numeric(frame[name], errors="coerce")
         if converted.notna().any():
