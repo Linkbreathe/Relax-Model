@@ -39,4 +39,5 @@ Thumbs.db
 .claude/
 **/artifacts/
 /src/real_time_ml/features.zip
+Auxiliary/archive/
 /xaa

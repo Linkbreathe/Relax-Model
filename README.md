@@ -225,6 +225,7 @@ Shadow and Adaptive Control use the same default UDP ports: run the intended ser
 configs/                         Shared, legacy, experiment, and control settings
 data/contracts/                  Input, label, feature, and output contracts
 src/real_time_ml/
+  README.md                      Package namespace and module map
   cli.py                         rtml command entry point
   data/                          Source indexing and table / video I/O
   preprocessing/                 Boundaries, windows, and audit processing
