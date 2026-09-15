@@ -33,3 +33,10 @@ dist/
 *.code-workspace
 .DS_Store
 Thumbs.db
+
+# Local analysis outputs and scratch files
+.pytest-tmp*/
+.claude/
+**/artifacts/
+/src/real_time_ml/features.zip
+/xaa
