@@ -62,7 +62,7 @@ Raw recordings and questionnaires are external inputs. They are not distributed 
 
 ### Windows RQ2 representation track
 
-The dedicated [Windows RQ2 module](src/real_time_ml/rq2_windows.py) validates a separate, locked **FMQ-9** contract: 9 participants, 81 condition labels, 567 source windows, and 545 common-valid windows. It preserves the `P004/C6` condition key even when no common-valid window is available, rather than silently removing that observation.
+The dedicated [Windows RQ2 representation module](src/real_time_ml/windows_rq2_representations.py) validates a separate, locked **FMQ-9** contract: 9 participants, 81 condition labels, 567 source windows, and 545 common-valid windows. It preserves the `P004/C6` condition key even when no common-valid window is available, rather than silently removing that observation.
 
 This track builds Windows-side representations and handoff metadata. `WINDOWS_DONE.json` marks completion of that track only. Downstream fusion, pretrained representations in a separate environment, and combined statistical conclusions are outside the completion claim of this marker. These cohort counts are contract expectations, not a report of a new run.
 
@@ -236,7 +236,7 @@ src/real_time_ml/
   realtime/                      Shadow clock, buffers, engine, and service
   adaptive_control/              Separate experimental control runtime
   reporting/                     Run summaries
-  rq2_windows.py                 Windows representation handoff
+  windows_rq2_representations.py Windows representation handoff
 analysis/
   adaptive_offline/              Offline measurement and control simulations
   decision_reanalysis/           Recorded decision reanalysis

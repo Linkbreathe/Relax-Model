@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from real_time_ml.rq2_windows import (
+from real_time_ml.windows_rq2_representations import (
     CONDITIONS,
     MODALITIES,
     PARTICIPANTS,
