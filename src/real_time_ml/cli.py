@@ -39,6 +39,15 @@ def build_parser() -> argparse.ArgumentParser:
     mae = commands.add_parser("extract-videomae2", help="extract frozen official VideoMAE V2 embeddings from retained MP4")
     mae.add_argument("--participants", help="comma-separated participant ids")
     mae.add_argument("--force", action="store_true", help="discard matching embedding cache")
+    dynamic = commands.add_parser(
+        "extract-dynamic-texture",
+        help="research-only 12-value dynamic_texture_v1 extraction on the frozen common mask",
+    )
+    dynamic.add_argument("--participants", help="comma-separated participant ids")
+    dynamic.add_argument("--contract-dir", type=Path)
+    dynamic.add_argument("--base-window-features", type=Path)
+    dynamic.add_argument("--output-dir", type=Path)
+    dynamic.add_argument("--force", action="store_true", help="discard a matching descriptor cache")
     commands.add_parser("train-video-ml", help="LOPO handcrafted-video ML and same-cohort no-video comparisons")
     commands.add_parser("train-videomae2-dcnn", help="LOPO frozen VideoMAE2 + 1DCNN fusion and fallback")
     commands.add_parser("report-video-fusion", help="write evidence-backed Chinese ML/DL egocentric-video report")
@@ -143,6 +152,17 @@ def main(argv: list[str] | None = None) -> int:
         from real_time_ml.features.videomae2 import extract_videomae2_embeddings
 
         result = extract_videomae2_embeddings(config, selected, force=args.force)
+    elif args.command == "extract-dynamic-texture":
+        from real_time_ml.features.dynamic_texture import extract_dynamic_texture_features
+
+        result = extract_dynamic_texture_features(
+            config,
+            selected,
+            contract_dir=args.contract_dir,
+            base_window_features=args.base_window_features,
+            output_dir=args.output_dir,
+            force=args.force,
+        )
     elif args.command == "train-video-ml":
         from real_time_ml.modeling.video_train import train_handcrafted_video_ml
 

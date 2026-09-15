@@ -9,6 +9,12 @@ import numpy as np
 from scipy.stats import spearmanr
 
 from real_time_ml.config import ProjectConfig
+from real_time_ml.evaluation.alignment import (
+    indexes_for_fold,
+    load_split_manifest,
+    validate_alignment_contract,
+    write_alignment_manifest,
+)
 from real_time_ml.modeling.condition_data import STATIC_COLUMNS, build_condition_dataset
 from real_time_ml.modeling.condition_models import (
     ModelSpec,
@@ -22,6 +28,8 @@ from real_time_ml.utils import write_json
 
 
 TARGETS = ("relaxation", "discomfort")
+PROJECT_A_MODALITIES = ("eeg", "ecg", "eye", "head")
+CONDITION_VARIANTS = ("full", "no_eeg", "no_ecg", "no_eye", "no_head", "behavior_only")
 
 
 def _dependencies():
@@ -162,6 +170,52 @@ def _inner_rank_regression(train, columns, target: str, specs: list[ModelSpec], 
     return sorted(ranked, key=lambda item: (item["score"], item["mae"]))
 
 
+def _rank_regression_on_validation(
+    train,
+    validation,
+    columns,
+    target: str,
+    specs: list[ModelSpec],
+    config: ProjectConfig,
+    pd,
+):
+    """Rank candidates on the manifest validation participant only."""
+
+    baseline_map, fallback = condition_baseline(train, target)
+    residual = train[target].to_numpy(dtype=float) - apply_condition_baseline(
+        train["condition"], baseline_map, fallback
+    )
+    validation_baseline = apply_condition_baseline(validation["condition"], baseline_map, fallback)
+    X_train = _matrix(train, columns, pd)
+    X_validation = _matrix(validation, columns, pd)
+    ranked = []
+    for order, spec in enumerate(specs):
+        try:
+            model = make_regression_pipeline(
+                spec,
+                int(config.get("modeling.random_seed")) + order,
+                float(config.get("modeling.condition_level.min_non_missing_fraction")),
+                float(config.get("modeling.condition_level.correlation_threshold")),
+            )
+            model.fit(X_train, residual)
+            prediction = np.clip(validation_baseline + model.predict(X_validation), 0.0, 1.0)
+            mae = float(np.mean(np.abs(validation[target].to_numpy(dtype=float) - prediction)))
+            rank = _ranking_accuracy(validation, prediction, target)
+            rank_value = float(rank) if np.isfinite(rank) else 0.0
+            score = mae - (0.02 * rank_value if target == "relaxation" else 0.0)
+        except (ValueError, FloatingPointError):
+            mae, rank_value, score = float("inf"), float("nan"), float("inf")
+        ranked.append(
+            {
+                "spec": spec,
+                "mae": mae,
+                "ranking_accuracy": rank_value,
+                "score": score,
+            }
+        )
+    return sorted(ranked, key=lambda item: (item["score"], item["mae"], item["spec"].label()))
+
+
 def _choose_feature_count_regression(train, columns, target: str, config: ProjectConfig, pd, GroupKFold):
     """Select K inside the outer training fold before comparing model families."""
     trials = _inner_rank_regression(
@@ -239,6 +293,50 @@ def _inner_rank_risk(train, columns, specs, config, pd, GroupKFold, deps):
     return sorted(ranked, key=lambda item: (item["selected"]["false_negatives"], -item["selected"]["recall"], -item["selected"]["precision"]))
 
 
+def _rank_risk_on_validation(train, validation, columns, specs, config, pd, deps):
+    """Rank high-discomfort models without using the held-out test participant."""
+
+    label_threshold = float(config.get("modeling.condition_level.high_discomfort_label_threshold"))
+    thresholds = list(config.get("modeling.condition_level.risk_probability_thresholds"))
+    y_train = (train["discomfort"].to_numpy(dtype=float) >= label_threshold).astype(int)
+    y_validation = (validation["discomfort"].to_numpy(dtype=float) >= label_threshold).astype(int)
+    if len(np.unique(y_train)) < 2:
+        return []
+    X_train = _matrix(train, columns, pd)
+    X_validation = _matrix(validation, columns, pd)
+    ranked = []
+    for order, spec in enumerate(specs):
+        try:
+            model = make_risk_pipeline(
+                spec,
+                int(config.get("modeling.random_seed")) + order,
+                float(config.get("modeling.condition_level.min_non_missing_fraction")),
+                float(config.get("modeling.condition_level.correlation_threshold")),
+            )
+            model.fit(X_train, y_train)
+            probability = _positive_probability(model, X_validation)
+            selected, table = _choose_risk_threshold(y_validation, probability, thresholds, deps)
+            ranked.append(
+                {
+                    "spec": spec,
+                    "selected": selected,
+                    "threshold_table": table,
+                    "probability": probability,
+                }
+            )
+        except (ValueError, FloatingPointError):
+            continue
+    return sorted(
+        ranked,
+        key=lambda item: (
+            item["selected"]["false_negatives"],
+            -item["selected"]["recall"],
+            -item["selected"]["precision"],
+            item["spec"].label(),
+        ),
+    )
+
+
 def _choose_feature_count_risk(train, columns, config, pd, GroupKFold, deps):
     trials = _inner_rank_risk(
         train,
@@ -283,10 +381,30 @@ def _predict_risk_models(test, columns, models, fallback, pd):
 def _variant_columns(columns: list[str], variant: str) -> list[str]:
     if variant == "full":
         return columns
-    if variant == "no_eeg":
-        return [name for name in columns if not name.startswith("eeg_")]
+    if variant in {"no_eeg", "no_ecg", "no_eye", "no_head"}:
+        modality = variant.removeprefix("no_")
+
+        def belongs_to_removed_modality(name: str) -> bool:
+            if name.startswith((f"{modality}_", f"qc_{modality}_", f"mask_{modality}_")):
+                return True
+            # This flag jointly describes the EEG/ECG acquisition stream and
+            # must not survive removal of either physiological modality.
+            return modality in {"eeg", "ecg"} and name.startswith("qc_physio_complete")
+
+        return [name for name in columns if not belongs_to_removed_modality(name)]
     if variant == "behavior_only":
         return [name for name in columns if name.startswith(("head_", "eye_"))]
+    raise ValueError(variant)
+
+
+def _variant_modalities(variant: str) -> tuple[str, ...]:
+    if variant == "full":
+        return PROJECT_A_MODALITIES
+    if variant in {"no_eeg", "no_ecg", "no_eye", "no_head"}:
+        removed = variant.removeprefix("no_")
+        return tuple(modality for modality in PROJECT_A_MODALITIES if modality != removed)
+    if variant == "behavior_only":
+        return ("eye", "head")
     raise ValueError(variant)
 
 
@@ -362,7 +480,21 @@ def train_condition_state(
     """
     deps = _dependencies()
     pd, joblib = deps["pd"], deps["joblib"]
-    source = source or config.path("features") / "window_features.csv"
+    aligned = bool(config.get("alignment.enabled", False))
+    contract_payload: dict[str, Any] | None = None
+    expected_train_count = 13
+    if aligned:
+        contract_dir = Path(str(config.get("alignment.contract_dir")))
+        contract_payload = validate_alignment_contract(contract_dir)
+        expected_labels = int(
+            contract_payload.get("label_count", contract_payload.get("observation_count", expected_labels))
+        )
+        expected_train_count = int(
+            contract_payload.get("fold_contract", {}).get("train_participants", 13)
+        )
+        source = source or Path(str(config.get("alignment.window_features")))
+    else:
+        source = source or config.path("features") / "window_features.csv"
     if not source.exists():
         raise FileNotFoundError("Run 'rtml extract-features' before condition-level training")
     output_path = condition_output or config.path("features") / "condition_features.csv"
@@ -376,9 +508,28 @@ def train_condition_state(
     if len(frame) != expected_labels or frame[["participant_id", "condition"]].duplicated().any():
         raise ValueError(f"Expected exactly {expected_labels} unique participant/Condition labels; found {len(frame)}")
     frame = frame.reset_index(drop=True)
-    columns = _feature_columns(frame)
+    all_columns = _feature_columns(frame)
+    if aligned:
+        # The aligned Project A definition is EEG+ECG+eye+head. Video QC and
+        # mask fields are provenance, not Project A predictor variables.
+        all_columns = [
+            name
+            for name in all_columns
+            if not name.startswith(("video_", "qc_video_", "mask_video_"))
+        ]
+    model_variant = str(config.get("modeling.condition_variant", "full"))
+    if model_variant not in CONDITION_VARIANTS:
+        raise ValueError(f"Unknown classical Condition variant: {model_variant!r}")
+    columns = _variant_columns(all_columns, model_variant)
+    if not columns:
+        raise ValueError(f"No usable features remain for classical variant {model_variant!r}")
+    modalities = _variant_modalities(model_variant)
+    split_protocol = (
+        f"shared_{expected_train_count}_train_1_validation_1_test"
+        if aligned
+        else "native_14_non_test_nested_lopo"
+    )
     model_names = list(config.get("modeling.candidates"))
-    outer = deps["LeaveOneGroupOut"]()
     groups = frame["participant_id"].astype(str).to_numpy()
     predictions = {target: np.full(len(frame), np.nan) for target in TARGETS}
     condition_baseline_predictions = {target: np.full(len(frame), np.nan) for target in TARGETS}
@@ -388,22 +539,88 @@ def train_condition_state(
     fold_records = []
     selected_counts = {target: Counter() for target in TARGETS}
     risk_selected_counts: Counter[str] = Counter()
-    for fold_index, (train_index, test_index) in enumerate(outer.split(frame, groups=groups), start=1):
+    row_fold = np.full(len(frame), -1, dtype=int)
+    row_validation = np.full(len(frame), "", dtype=object)
+    if aligned:
+        split_manifest = Path(str(config.get("alignment.split_manifest")))
+        folds = load_split_manifest(
+            split_manifest,
+            expected_participants=sorted(set(groups)),
+            expected_train_count=expected_train_count,
+        )
+        split_iterator = [
+            (fold, *indexes_for_fold(groups, fold))
+            for fold in folds
+        ]
+    else:
+        outer = deps["LeaveOneGroupOut"]()
+        split_iterator = []
+        folds = []
+        for fold_index, (train_index, test_index) in enumerate(
+            outer.split(frame, groups=groups), start=1
+        ):
+            test_participant = str(groups[test_index][0])
+            split_iterator.append((None, train_index, np.asarray([], dtype=int), test_index))
+
+    for fold_position, (aligned_fold, train_index, validation_index, test_index) in enumerate(
+        split_iterator, start=1
+    ):
+        fold_index = aligned_fold.fold_index if aligned_fold is not None else fold_position
         train, test = frame.iloc[train_index], frame.iloc[test_index]
-        fold_record: dict[str, Any] = {"fold": fold_index, "test_participant": str(test.iloc[0]["participant_id"]), "targets": {}}
+        validation = frame.iloc[validation_index] if len(validation_index) else None
+        test_participant = str(test.iloc[0]["participant_id"])
+        validation_participant = (
+            str(validation.iloc[0]["participant_id"]) if validation is not None else None
+        )
+        row_fold[test_index] = fold_index
+        row_validation[test_index] = validation_participant or ""
+        fold_record: dict[str, Any] = {
+            "fold": fold_index,
+            "test_participant": test_participant,
+            "validation_participant": validation_participant,
+            "train_participants": sorted(train["participant_id"].astype(str).unique()),
+            "n_train_participants": int(train["participant_id"].nunique()),
+            "n_validation_participants": int(validation["participant_id"].nunique()) if validation is not None else 0,
+            "n_test_participants": int(test["participant_id"].nunique()),
+            "targets": {},
+        }
         for target in TARGETS:
-            selected_k, feature_count_trials = _choose_feature_count_regression(
-                train, columns, target, config, pd, deps["GroupKFold"]
-            )
-            ranked = _inner_rank_regression(
-                train,
-                columns,
-                target,
-                [ModelSpec(name, selected_k) for name in model_names],
-                config,
-                pd,
-                deps["GroupKFold"],
-            )
+            if aligned:
+                feature_count_trials = _rank_regression_on_validation(
+                    train,
+                    validation,
+                    columns,
+                    target,
+                    [
+                        ModelSpec("ridge", int(k))
+                        for k in config.get("modeling.condition_level.feature_counts")
+                    ],
+                    config,
+                    pd,
+                )
+                selected_k = int(feature_count_trials[0]["spec"].feature_count)
+                ranked = _rank_regression_on_validation(
+                    train,
+                    validation,
+                    columns,
+                    target,
+                    [ModelSpec(name, selected_k) for name in model_names],
+                    config,
+                    pd,
+                )
+            else:
+                selected_k, feature_count_trials = _choose_feature_count_regression(
+                    train, columns, target, config, pd, deps["GroupKFold"]
+                )
+                ranked = _inner_rank_regression(
+                    train,
+                    columns,
+                    target,
+                    [ModelSpec(name, selected_k) for name in model_names],
+                    config,
+                    pd,
+                    deps["GroupKFold"],
+                )
             top = [item["spec"] for item in ranked[: int(config.get("modeling.condition_level.ensemble_size"))]]
             baseline_map, fallback, models = _fit_target_models(train, columns, target, top, config, pd)
             prediction = _predict_target_models(test, columns, baseline_map, fallback, models, pd)
@@ -416,17 +633,43 @@ def train_condition_state(
                 "inner_top": [{key: value for key, value in item.items() if key != "spec"} | {"spec": asdict(item["spec"])} for item in ranked[:3]],
                 "feature_count_trials": [{key: value for key, value in item.items() if key != "spec"} | {"spec": asdict(item["spec"])} for item in feature_count_trials],
             }
-        risk_k, risk_feature_count_trials = _choose_feature_count_risk(
-            train, columns, config, pd, deps["GroupKFold"], deps
-        )
+        if aligned:
+            risk_feature_count_trials = _rank_risk_on_validation(
+                train,
+                validation,
+                columns,
+                [
+                    ModelSpec("logistic_regression", int(k))
+                    for k in config.get("modeling.condition_level.feature_counts")
+                ],
+                config,
+                pd,
+                deps,
+            )
+            risk_k = int(
+                risk_feature_count_trials[0]["spec"].feature_count
+                if risk_feature_count_trials
+                else config.get("modeling.condition_level.feature_counts")[0]
+            )
+        else:
+            risk_k, risk_feature_count_trials = _choose_feature_count_risk(
+                train, columns, config, pd, deps["GroupKFold"], deps
+            )
         risk_specs = [ModelSpec("logistic_regression", risk_k), ModelSpec("svm_classifier", risk_k)]
-        risk_ranked = _inner_rank_risk(train, columns, risk_specs, config, pd, deps["GroupKFold"], deps)
+        risk_ranked = (
+            _rank_risk_on_validation(train, validation, columns, risk_specs, config, pd, deps)
+            if aligned
+            else _inner_rank_risk(train, columns, risk_specs, config, pd, deps["GroupKFold"], deps)
+        )
         top_risk = [item["spec"] for item in risk_ranked[: int(config.get("modeling.condition_level.risk_ensemble_size"))]]
         if top_risk:
             inner_probability = np.nanmean(np.vstack([next(item["probability"] for item in risk_ranked if item["spec"] == spec) for spec in top_risk]), axis=0)
             valid = np.isfinite(inner_probability)
             selected_threshold, _ = _choose_risk_threshold(
-                (train["discomfort"].to_numpy(dtype=float)[valid] >= float(config.get("modeling.condition_level.high_discomfort_label_threshold"))).astype(int),
+                (
+                    validation["discomfort"].to_numpy(dtype=float)[valid]
+                    >= float(config.get("modeling.condition_level.high_discomfort_label_threshold"))
+                ).astype(int),
                 inner_probability[valid],
                 config.get("modeling.condition_level.risk_probability_thresholds"), deps,
             )
@@ -446,9 +689,22 @@ def train_condition_state(
             ],
         }
         fold_records.append(fold_record)
-        print(f"Condition LOPO fold {fold_index}/15: {fold_record['test_participant']}", flush=True)
+        print(
+            f"Condition {model_variant} LOPO fold {fold_index}/{len(split_iterator)}: "
+            f"{fold_record['test_participant']}",
+            flush=True,
+        )
 
-    metrics: dict[str, Any] = {"unit_of_analysis": "participant_condition", "n_labels": int(len(frame)), "targets": {}}
+    metrics: dict[str, Any] = {
+        "unit_of_analysis": "participant_condition",
+        "n_labels": int(len(frame)),
+        "seed": int(config.get("modeling.random_seed")),
+        "model_variant": model_variant,
+        "modalities": list(modalities),
+        "split_protocol": split_protocol,
+        "runtime": {"device": "cpu", "cuda_used": False},
+        "targets": {},
+    }
     for target in TARGETS:
         truth = frame[target].to_numpy(dtype=float)
         metrics["targets"][target] = {
@@ -501,8 +757,9 @@ def train_condition_state(
     selected_risk_specs = [risk_lookup[label] for label, _ in risk_selected_counts.most_common(int(config.get("modeling.condition_level.risk_ensemble_size")))] or [risk_specs[0]]
     final_threshold = float(np.nanmedian(risk_thresholds))
     bundles = {}
-    for variant in ("full", "no_eeg", "behavior_only"):
-        variant_columns = _variant_columns(columns, variant)
+    bundle_variants = (model_variant,) if aligned else ("full", "no_eeg", "behavior_only")
+    for variant in bundle_variants:
+        variant_columns = columns if aligned else _variant_columns(all_columns, variant)
         if variant_columns:
             bundle = _fit_final_bundle(frame, variant_columns, selected_specs, selected_risk_specs, final_threshold, config, pd)
             bundle["model_variant"] = variant
@@ -514,7 +771,7 @@ def train_condition_state(
             }
             bundles[variant] = bundle
             joblib.dump(bundle, models_dir / f"state_model_{variant}.joblib")
-    joblib.dump(bundles["full"], models_dir / "state_model.joblib")
+    joblib.dump(bundles[model_variant if aligned else "full"], models_dir / "state_model.joblib")
     predictions_output = frame[["participant_id", "condition", "presentation_position", *TARGETS]].copy()
     for target in TARGETS:
         predictions_output[f"pred_{target}"] = predictions[target]
@@ -523,21 +780,67 @@ def train_condition_state(
     predictions_output["risk_probability"] = risk_probability
     predictions_output["risk_threshold"] = risk_thresholds
     predictions_output["high_discomfort"] = high_risk
+    predictions_output["seed"] = int(config.get("modeling.random_seed"))
+    predictions_output["fold_index"] = row_fold
+    predictions_output["test_participant"] = predictions_output["participant_id"].astype(str)
+    predictions_output["validation_participant"] = row_validation
+    predictions_output["model_variant"] = model_variant
+    predictions_output["modalities"] = "+".join(modalities)
+    predictions_output["split_protocol"] = split_protocol
+    predictions_output["device"] = "cpu"
+    predictions_output["cuda_used"] = False
     prediction_dir = config.path("predictions") if not config.is_legacy and reports_dir == config.path("reports") else reports_dir
     prediction_dir.mkdir(parents=True, exist_ok=True)
     predictions_output.to_csv(prediction_dir / "condition_level_lopo_predictions.csv", index=False)
     report = {
         "schema_version": config.data["schema_version"],
         "metrics": metrics,
+        "model_variant": model_variant,
+        "modalities": list(modalities),
         "feature_count_before_fold_selection": len(columns),
+        "feature_count_before_ablation": len(all_columns),
         "candidate_models": list(config.get("modeling.candidates")),
         "feature_counts_tried": list(config.get("modeling.condition_level.feature_counts")),
         "selected_spec_frequency": {target: dict(counter) for target, counter in selected_counts.items()},
         "selected_risk_spec_frequency": dict(risk_selected_counts),
         "folds": fold_records,
+        "seed": int(config.get("modeling.random_seed")),
+        "split_protocol": split_protocol,
+        "runtime": {"device": "cpu", "cuda_used": False},
     }
+    if aligned:
+        report["alignment"] = {
+            "contract_dir": str(Path(str(config.get("alignment.contract_dir"))).resolve()),
+            "split_manifest": str(Path(str(config.get("alignment.split_manifest"))).resolve()),
+            "modality_masks": str(Path(str(config.get("alignment.modality_masks"))).resolve()),
+            "labels": str(Path(str(config.get("alignment.labels"))).resolve()),
+            "windows": str(Path(str(config.get("alignment.windows"))).resolve()),
+        }
+        write_alignment_manifest(
+            config.path("manifests") / "classical_alignment_manifest.json",
+            split_manifest=config.get("alignment.split_manifest"),
+            modality_masks=config.get("alignment.modality_masks"),
+            labels=config.get("alignment.labels"),
+            windows=config.get("alignment.windows"),
+            window_features=source,
+            contract=Path(str(config.get("alignment.contract_dir"))) / "contract.json",
+            seed=int(config.get("modeling.random_seed")),
+            folds=folds,
+            runtime={
+                "device": "cpu",
+                "cuda_used": False,
+                "model": "classical_residual_ensemble",
+                "model_variant": model_variant,
+                "modalities": list(modalities),
+            },
+        )
     write_json(reports_dir / "condition_level_lopo_metrics.json", report)
-    return {"model_path": str(models_dir / "state_model.joblib"), "metrics": metrics, "n_condition_labels": int(len(frame))}
+    return {
+        "model_path": str(models_dir / "state_model.joblib"),
+        "metrics": metrics,
+        "model_variant": model_variant,
+        "n_condition_labels": int(len(frame)),
+    }
 
 
 def predict_condition_bundle(bundle: dict[str, Any], features: dict[str, Any], condition: str | None, pd):

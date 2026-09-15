@@ -21,6 +21,12 @@ import numpy as np
 
 from real_time_ml.config import ProjectConfig
 from real_time_ml.data.io import condition_parameters
+from real_time_ml.evaluation.alignment import (
+    indexes_for_fold,
+    load_split_manifest,
+    validate_alignment_contract,
+    write_alignment_manifest,
+)
 from real_time_ml.modeling.safety import deployment_guard
 from real_time_ml.utils import atomic_write_text, write_json
 
@@ -28,7 +34,8 @@ from real_time_ml.utils import atomic_write_text, write_json
 MODEL_KIND = "dcnn_condition_regressor_v1"
 TARGETS = ("relaxation", "discomfort")
 CONTEXT_COLUMNS = ("intensity", "frequency")
-VARIANTS = ("full", "no_eeg", "behavior_only")
+PROJECT_A_MODALITIES = ("eeg", "ecg", "eye", "head")
+VARIANTS = ("full", "no_eeg", "no_ecg", "no_eye", "no_head", "behavior_only")
 REALTIME_PREFIXES = ("eeg_", "ecg_", "head_", "eye_")
 
 
@@ -66,6 +73,19 @@ def _device(value: str):
             )
         return torch.device(requested)
     return torch.device("cpu")
+
+
+def _runtime_provenance(device) -> dict[str, Any]:
+    torch = _torch()
+    cuda = device.type == "cuda"
+    return {
+        "device": str(device),
+        "cuda_used": bool(cuda),
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device_name": torch.cuda.get_device_name(device) if cuda else None,
+        "torch_version": str(torch.__version__),
+        "cuda_runtime": str(torch.version.cuda) if torch.version.cuda else None,
+    }
 
 
 @lru_cache(maxsize=1)
@@ -272,10 +292,22 @@ def _variant_columns(columns: Iterable[str], variant: str) -> list[str]:
     available = [name for name in columns if name.startswith(REALTIME_PREFIXES)]
     if variant == "full":
         return available
-    if variant == "no_eeg":
-        return [name for name in available if not name.startswith("eeg_")]
+    if variant in {"no_eeg", "no_ecg", "no_eye", "no_head"}:
+        removed = variant.removeprefix("no_")
+        return [name for name in available if not name.startswith(f"{removed}_")]
     if variant == "behavior_only":
         return [name for name in available if name.startswith(("head_", "eye_"))]
+    raise ValueError(f"Unknown DCNN model variant: {variant}")
+
+
+def _variant_modalities(variant: str) -> tuple[str, ...]:
+    if variant == "full":
+        return PROJECT_A_MODALITIES
+    if variant in {"no_eeg", "no_ecg", "no_eye", "no_head"}:
+        removed = variant.removeprefix("no_")
+        return tuple(modality for modality in PROJECT_A_MODALITIES if modality != removed)
+    if variant == "behavior_only":
+        return ("eye", "head")
     raise ValueError(f"Unknown DCNN model variant: {variant}")
 
 
@@ -402,6 +434,8 @@ def _train_model(
     torch.manual_seed(int(seed))
     if device.type == "cuda":
         torch.cuda.manual_seed_all(int(seed))
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     model = _make_model(len(scaler["feature_indexes"]), architecture).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -416,8 +450,11 @@ def _train_model(
     validation_indexes = validation_indexes if len(validation_indexes) else train_indexes
     best_loss = float("inf")
     best_state = None
+    best_epoch = 0
     stale_epochs = 0
-    for _ in range(epochs):
+    epochs_ran = 0
+    for epoch in range(epochs):
+        epochs_ran = epoch + 1
         prefixes = np.asarray([rng.integers(1, int(sequences.lengths[index]) + 1) for index in train_indexes], dtype=int)
         train_values, train_context = _transform(sequences, train_indexes, scaler, prefixes)
         order = rng.permutation(len(train_indexes))
@@ -447,6 +484,7 @@ def _train_model(
         if validation_loss < best_loss - 1e-8:
             best_loss = validation_loss
             best_state = deepcopy({key: value.detach().cpu() for key, value in model.state_dict().items()})
+            best_epoch = epoch + 1
             stale_epochs = 0
         else:
             stale_epochs += 1
@@ -456,7 +494,7 @@ def _train_model(
         raise RuntimeError("DCNN training did not produce a checkpoint")
     model.load_state_dict(best_state)
     model.eval()
-    return model, best_loss
+    return model, best_loss, {"best_epoch": int(best_epoch), "epochs_ran": int(epochs_ran)}
 
 
 def _predict_model(model, sequences: ConditionSequences, indexes: np.ndarray, scaler: dict[str, Any], device, prefix: int | None = None) -> np.ndarray:
@@ -630,23 +668,75 @@ def write_dcnn_comparison_report(config: ProjectConfig, reports: dict[str, Any])
 
 def train_dcnn_state(config: ProjectConfig) -> dict[str, Any]:
     """Train and evaluate the DCNN without replacing the selected classical backend."""
-    source = config.path("features") / "window_features.csv"
+    aligned = bool(config.get("alignment.enabled", False))
+    contract_payload: dict[str, Any] | None = None
+    expected_labels = 135
+    expected_train_count = 13
+    if aligned:
+        contract_payload = validate_alignment_contract(Path(str(config.get("alignment.contract_dir"))))
+        expected_labels = int(
+            contract_payload.get("label_count", contract_payload.get("observation_count", 135))
+        )
+        expected_train_count = int(
+            contract_payload.get("fold_contract", {}).get("train_participants", 13)
+        )
+        source = Path(str(config.get("alignment.window_features")))
+    else:
+        source = config.path("features") / "window_features.csv"
     if not source.exists():
         raise FileNotFoundError("Run 'rtml extract-features' before DCNN training")
     device = _device(config.get("modeling.dcnn.device", "cuda"))
+    if aligned and bool(config.get("alignment.require_cuda", True)) and device.type != "cuda":
+        raise RuntimeError("Aligned DCNN experiments require an explicit CUDA device")
+    runtime = _runtime_provenance(device)
     from sklearn.model_selection import LeaveOneGroupOut
 
     reports: dict[str, Any] = {}
     all_prediction_rows: list[dict[str, Any]] = []
-    for variant in VARIANTS:
+    configured_variants = tuple(config.get("modeling.dcnn.variants", VARIANTS))
+    unknown_variants = sorted(set(configured_variants) - set(VARIANTS))
+    if unknown_variants:
+        raise ValueError(f"Unknown DCNN variants: {unknown_variants}")
+    aligned_folds = []
+    split_protocol = (
+        f"shared_{expected_train_count}_train_1_validation_1_test"
+        if aligned
+        else "project_a_native_lopo"
+    )
+    for variant in configured_variants:
         sequences = build_condition_sequences(source, config, variant)
-        if len(sequences.targets) != 135 or len(set(zip(sequences.participant_ids, sequences.conditions, strict=True))) != 135:
-            raise ValueError(f"DCNN expects exactly 135 unique participant/Condition labels; found {len(sequences.targets)}")
+        if len(sequences.targets) != expected_labels or len(
+            set(zip(sequences.participant_ids, sequences.conditions, strict=True))
+        ) != expected_labels:
+            raise ValueError(
+                f"DCNN expects exactly {expected_labels} unique participant/Condition labels; "
+                f"found {len(sequences.targets)}"
+            )
         groups = sequences.participant_ids
-        outer = LeaveOneGroupOut()
+        modalities = _variant_modalities(variant)
+        if aligned:
+            aligned_folds = load_split_manifest(
+                Path(str(config.get("alignment.split_manifest"))),
+                expected_participants=sorted(set(groups)),
+                expected_train_count=expected_train_count,
+            )
+            split_iterator = [
+                (fold.fold_index, fold, *indexes_for_fold(groups, fold))
+                for fold in aligned_folds
+            ]
+        else:
+            outer = LeaveOneGroupOut()
+            split_iterator = [
+                (fold, None, train_indexes, np.asarray([], dtype=int), test_indexes)
+                for fold, (train_indexes, test_indexes) in enumerate(
+                    outer.split(sequences.values, groups=groups), start=1
+                )
+            ]
         prediction = np.full_like(sequences.targets, np.nan, dtype=float)
         condition_baseline = np.full_like(sequences.targets, np.nan, dtype=float)
         history_baseline = np.full_like(sequences.targets, np.nan, dtype=float)
+        row_fold = np.full(len(sequences.targets), -1, dtype=int)
+        row_validation = np.full(len(sequences.targets), "", dtype=object)
         prefix_prediction = {
             length: np.full_like(sequences.targets, np.nan, dtype=float)
             for length in range(1, int(_architecture(config)["sequence_length"]) + 1)
@@ -655,32 +745,61 @@ def train_dcnn_state(config: ProjectConfig) -> dict[str, Any]:
         architecture = _architecture(config)
         min_fraction = float(config.get("modeling.dcnn.min_non_missing_fraction", 0.4))
         seed = int(config.get("modeling.random_seed"))
-        for fold, (train_indexes, test_indexes) in enumerate(outer.split(sequences.values, groups=groups), start=1):
-            core_indexes, validation_indexes = _validation_indexes(groups, train_indexes, seed + fold)
+        for fold, aligned_fold, train_indexes, manifest_validation_indexes, test_indexes in split_iterator:
+            if aligned:
+                core_indexes = train_indexes
+                validation_indexes = manifest_validation_indexes
+            else:
+                core_indexes, validation_indexes = _validation_indexes(
+                    groups, train_indexes, seed + fold
+                )
             scaler = _fit_scaler(sequences, core_indexes, min_fraction)
-            model, validation_loss = _train_model(
+            model, validation_loss, training_record = _train_model(
                 sequences, core_indexes, validation_indexes, scaler, architecture, config, seed + fold, device
             )
             prediction[test_indexes] = _predict_model(model, sequences, test_indexes, scaler, device)
             for length, output in prefix_prediction.items():
                 output[test_indexes] = _predict_model(model, sequences, test_indexes, scaler, device, prefix=length)
-            condition_baseline[test_indexes] = _condition_baseline(sequences, train_indexes, test_indexes)
+            condition_baseline[test_indexes] = _condition_baseline(sequences, core_indexes, test_indexes)
             history_baseline[test_indexes] = _history_baseline(
-                sequences, test_indexes, np.mean(sequences.targets[train_indexes], axis=0)
+                sequences, test_indexes, np.mean(sequences.targets[core_indexes], axis=0)
             )
+            validation_participant = str(groups[validation_indexes][0]) if len(validation_indexes) else None
+            row_fold[test_indexes] = int(fold)
+            row_validation[test_indexes] = validation_participant or ""
             folds.append(
                 {
                     "fold": fold,
                     "test_participant": str(groups[test_indexes][0]),
-                    "validation_participant": str(groups[validation_indexes][0]) if len(validation_indexes) else None,
+                    "validation_participant": validation_participant,
+                    "train_participants": sorted(set(groups[core_indexes])),
+                    "n_train_participants": int(len(set(groups[core_indexes]))),
+                    "n_validation_participants": int(len(set(groups[validation_indexes]))),
+                    "n_test_participants": int(len(set(groups[test_indexes]))),
                     "feature_count": int(len(scaler["feature_indexes"])),
                     "validation_loss": float(validation_loss),
+                    "training_seed": int(seed + fold),
+                    **training_record,
+                    **runtime,
                 }
             )
-            print(f"DCNN {variant} LOPO fold {fold}/15: {groups[test_indexes][0]}", flush=True)
+            print(
+                f"DCNN {variant} LOPO fold {fold}/{len(split_iterator)}: "
+                f"{groups[test_indexes][0]}",
+                flush=True,
+            )
         high_risk = (sequences.targets[:, 1] >= float(config.get("modeling.condition_level.high_discomfort_label_threshold"))).astype(int)
         threshold = float(config.get("modeling.condition_level.high_discomfort_label_threshold"))
-        metrics: dict[str, Any] = {"unit_of_analysis": "participant_condition", "n_labels": int(len(sequences.targets)), "targets": {}}
+        metrics: dict[str, Any] = {
+            "unit_of_analysis": "participant_condition",
+            "n_labels": int(len(sequences.targets)),
+            "seed": seed,
+            "model_variant": variant,
+            "modalities": list(modalities),
+            "split_protocol": split_protocol,
+            "runtime": runtime,
+            "targets": {},
+        }
         for target_index, target in enumerate(TARGETS):
             truth = sequences.targets[:, target_index]
             metrics["targets"][target] = {
@@ -716,9 +835,21 @@ def train_dcnn_state(config: ProjectConfig) -> dict[str, Any]:
                     for target_index, target in enumerate(TARGETS)
                 },
             }
-        final_train, final_validation = _validation_indexes(groups, np.arange(len(groups)), seed)
+        if aligned:
+            final_fold = aligned_folds[0]
+            final_train, final_validation, final_excluded_test = indexes_for_fold(groups, final_fold)
+            final_scope = {
+                "kind": "fold_1_research_checkpoint",
+                "train_participants": list(final_fold.train_participants),
+                "validation_participant": final_fold.validation_participant,
+                "excluded_test_participant": final_fold.test_participant,
+                "excluded_test_rows": int(len(final_excluded_test)),
+            }
+        else:
+            final_train, final_validation = _validation_indexes(groups, np.arange(len(groups)), seed)
+            final_scope = {"kind": "native_all_data_with_internal_validation"}
         final_scaler = _fit_scaler(sequences, final_train, min_fraction)
-        final_model, _ = _train_model(
+        final_model, _, final_training_record = _train_model(
             sequences, final_train, final_validation, final_scaler, architecture, config, seed, device
         )
         checkpoint = _checkpoint_from_model(
@@ -731,6 +862,10 @@ def train_dcnn_state(config: ProjectConfig) -> dict[str, Any]:
             interval_by_history=interval_by_history,
             config=config,
         )
+        checkpoint["runtime"] = runtime
+        checkpoint["seed"] = seed
+        checkpoint["training_scope"] = final_scope
+        checkpoint["training_record"] = final_training_record
         torch = _torch()
         checkpoint_path = config.path("models") / f"dcnn_state_{variant}.pt"
         torch.save(checkpoint, checkpoint_path)
@@ -740,6 +875,9 @@ def train_dcnn_state(config: ProjectConfig) -> dict[str, Any]:
             "prefix_metrics": prefix_metrics,
             "folds": folds,
             "feature_count_final": int(len(final_scaler["feature_indexes"])),
+            "runtime": runtime,
+            "seed": seed,
+            "training_scope": final_scope,
         }
         for index in range(len(sequences.targets)):
             all_prediction_rows.append(
@@ -756,10 +894,53 @@ def train_dcnn_state(config: ProjectConfig) -> dict[str, Any]:
                     "condition_only_discomfort": float(condition_baseline[index, 1]),
                     "history_relaxation": float(history_baseline[index, 0]),
                     "history_discomfort": float(history_baseline[index, 1]),
+                    "seed": seed,
+                    "fold_index": int(row_fold[index]),
+                    "test_participant": str(sequences.participant_ids[index]),
+                    "validation_participant": str(row_validation[index]),
+                    "modalities": "+".join(modalities),
+                    "split_protocol": split_protocol,
+                    "device": str(device),
+                    "cuda_used": bool(device.type == "cuda"),
                 }
             )
     report_path = config.path("reports") / "dcnn_condition_lopo_metrics.json"
-    write_json(report_path, {"schema_version": config.data["schema_version"], "variants": reports})
+    report_payload = {
+        "schema_version": config.data["schema_version"],
+        "seed": int(config.get("modeling.random_seed")),
+        "split_protocol": split_protocol,
+        "runtime": runtime,
+        "variants": reports,
+    }
+    if aligned:
+        report_payload["alignment"] = {
+            "contract_dir": str(Path(str(config.get("alignment.contract_dir"))).resolve()),
+            "split_manifest": str(Path(str(config.get("alignment.split_manifest"))).resolve()),
+            "modality_masks": str(Path(str(config.get("alignment.modality_masks"))).resolve()),
+            "labels": str(Path(str(config.get("alignment.labels"))).resolve()),
+            "windows": str(Path(str(config.get("alignment.windows"))).resolve()),
+        }
+        write_alignment_manifest(
+            config.path("manifests") / "dcnn_alignment_manifest.json",
+            split_manifest=config.get("alignment.split_manifest"),
+            modality_masks=config.get("alignment.modality_masks"),
+            labels=config.get("alignment.labels"),
+            windows=config.get("alignment.windows"),
+            window_features=source,
+            contract=Path(str(config.get("alignment.contract_dir"))) / "contract.json",
+            seed=int(config.get("modeling.random_seed")),
+            folds=aligned_folds,
+            runtime={
+                **runtime,
+                "model": "dcnn",
+                "variants": list(configured_variants),
+                "modalities": {
+                    variant: list(_variant_modalities(variant))
+                    for variant in configured_variants
+                },
+            },
+        )
+    write_json(report_path, report_payload)
     import pandas as pd
 
     prediction_dir = config.path("predictions") if not config.is_legacy else config.path("reports")
