@@ -25,7 +25,9 @@ def continuous_mne_audit(
     """Continuous MNE audit only; training features never come from this path."""
     import mne
 
-    names = channel_names or ["T7", "T8", "TP7", "TP8"]
+    # Raw electrode identity per eeg_columns order: [M2, TP9, TP10, M1] (M1/M2 are mastoid
+    # references; TP9/TP10 the temporo-parietal signals). Audit-only path; not a feature source.
+    names = channel_names or ["M2", "TP9", "TP10", "M1"]
     eeg_uV, unit_action = infer_microvolt_scale(np.asarray(samples)[:, eeg_columns])
     info = mne.create_info(names, sample_rate, ch_types="eeg")
     raw = mne.io.RawArray((eeg_uV * 1e-6).T, info, verbose="ERROR")

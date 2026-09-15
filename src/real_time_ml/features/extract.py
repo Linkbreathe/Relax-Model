@@ -15,7 +15,7 @@ from real_time_ml.data.video import load_video_index, sample_window_frames
 from real_time_ml.data.tables import read_rows, write_parquet_if_available, write_rows
 from real_time_ml.features.eye import eye_features
 from real_time_ml.features.head import head_features
-from real_time_ml.features.physio import StreamingPhysioProcessor, detect_r_peaks, hrv_features
+from real_time_ml.features.physio import EEGMontage, StreamingPhysioProcessor, detect_r_peaks, hrv_features
 from real_time_ml.features.video import video_features
 from real_time_ml.modeling.condition_data import aggregate_window_frame
 from real_time_ml.preprocessing.pipeline import preprocess
@@ -88,6 +88,7 @@ def _processor(config: ProjectConfig, participant: str, sample_rate: float) -> S
         ecg_columns=list(config.get("streams.ecg_columns")),
         counter_column=int(config.get("streams.counter_column")),
         bands=dict(config.get("features.eeg.bands")),
+        montage=EEGMontage.from_config(config),
         eeg_disabled=participant in set(config.get("participants.eeg_disabled")),
         strict_coverage_min=float(config.get("quality.eeg_strict_coverage_min")),
         eeg_abs_uV_max=float(config.get("quality.eeg_abs_uV_max")),

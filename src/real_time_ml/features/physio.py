@@ -44,12 +44,80 @@ def eeg_quality_coverage(eeg_uV: np.ndarray, sample_rate: float, abs_uV_max: flo
     return float(np.mean(usable)) if usable else 0.0
 
 
-def eeg_features(eeg_uV: np.ndarray, sample_rate: float, bands: dict[str, list[float]], car: bool = False) -> dict[str, float]:
-    values = np.asarray(eeg_uV, dtype=float)
+@dataclass(frozen=True)
+class EEGMontage:
+    """Electrode identity for the four raw EEG columns, aligned to ``eeg_columns``.
+
+    The hardware records four electrodes per sample: two mastoid references (M1/M2) and
+    two temporo-parietal signal electrodes (TP9 left, TP10 right). ``names``, ``roles`` and
+    ``hemispheres`` are index-for-index with the raw column slice handed to
+    :func:`eeg_features`. Only ``role == "signal"`` channels produce per-channel features;
+    the ``reference`` channels form the reference that is subtracted from the signals.
+    """
+
+    names: tuple[str, ...]
+    roles: tuple[str, ...]
+    hemispheres: tuple[str, ...]
+    reference_scheme: str = "linked_mastoid"
+
+    @classmethod
+    def from_config(cls, config: Any) -> "EEGMontage":
+        names = tuple(str(name) for name in config.get("streams.eeg_names"))
+        roles = tuple(str(role) for role in config.get("features.eeg.channel_roles"))
+        hemispheres = tuple(str(side) for side in config.get("features.eeg.channel_hemispheres"))
+        scheme = str(config.get("features.eeg.reference_scheme"))
+        if not (len(names) == len(roles) == len(hemispheres)):
+            raise ValueError("streams.eeg_names, features.eeg.channel_roles and channel_hemispheres must be equal length")
+        return cls(names=names, roles=roles, hemispheres=hemispheres, reference_scheme=scheme)
+
+    def _indices(self, role: str) -> list[int]:
+        return [index for index, value in enumerate(self.roles) if value == role]
+
+    @property
+    def signal_indices(self) -> list[int]:
+        return self._indices("signal")
+
+    @property
+    def reference_indices(self) -> list[int]:
+        return self._indices("reference")
+
+
+def apply_reference(values: np.ndarray, montage: EEGMontage) -> tuple[np.ndarray, list[str], list[str]]:
+    """Re-reference the raw electrode matrix and return (signal_matrix, names, hemispheres).
+
+    The returned matrix has one column per signal electrode, in ``eeg_columns`` order.
+    """
+    values = np.asarray(values, dtype=float)
+    signal_index = montage.signal_indices
+    reference_index = montage.reference_indices
+    if not signal_index:
+        raise ValueError("EEG montage defines no signal channels")
+    scheme = montage.reference_scheme
+    if scheme == "none" or not reference_index:
+        referenced = values[:, signal_index]
+    elif scheme == "linked_mastoid":
+        reference = np.mean(values[:, reference_index], axis=1, keepdims=True)
+        referenced = values[:, signal_index] - reference
+    elif scheme == "ipsilateral_mastoid":
+        columns = []
+        for channel in signal_index:
+            hemisphere = montage.hemispheres[channel]
+            matched = [ref for ref in reference_index if montage.hemispheres[ref] == hemisphere]
+            reference = np.mean(values[:, matched], axis=1) if matched else np.zeros(len(values))
+            columns.append(values[:, channel] - reference)
+        referenced = np.column_stack(columns)
+    else:
+        raise ValueError(f"Unknown EEG reference_scheme: {scheme!r}")
+    names = [montage.names[index].lower() for index in signal_index]
+    hemispheres = [montage.hemispheres[index] for index in signal_index]
+    return referenced, names, hemispheres
+
+
+def eeg_features(eeg_uV: np.ndarray, sample_rate: float, bands: dict[str, list[float]], montage: EEGMontage, car: bool = False) -> dict[str, float]:
+    referenced, names, hemispheres = apply_reference(eeg_uV, montage)
     if car:
-        values = values - np.mean(values, axis=1, keepdims=True)
-    filtered = causal_filter(values, 1.0, min(45.0, sample_rate * 0.45), sample_rate)
-    names = ["t7", "t8", "tp7", "tp8"]
+        referenced = referenced - np.mean(referenced, axis=1, keepdims=True)
+    filtered = causal_filter(referenced, 1.0, min(45.0, sample_rate * 0.45), sample_rate)
     output: dict[str, float] = {}
     band_values: dict[str, list[float]] = {name: [] for name in bands}
     for channel_index, channel_name in enumerate(names):
@@ -73,8 +141,9 @@ def eeg_features(eeg_uV: np.ndarray, sample_rate: float, bands: dict[str, list[f
     theta = float(np.nanmean(band_values.get("theta", [np.nan])))
     output["eeg_alpha_beta_ratio"] = safe_divide(alpha, beta)
     output["eeg_theta_beta_ratio"] = safe_divide(theta, beta)
-    left_alpha = np.nanmean([band_values.get("alpha", [np.nan] * 4)[i] for i in (0, 2)])
-    right_alpha = np.nanmean([band_values.get("alpha", [np.nan] * 4)[i] for i in (1, 3)])
+    alpha_by_channel = band_values.get("alpha", [np.nan] * len(names))
+    left_alpha = np.nanmean([alpha_by_channel[i] for i, side in enumerate(hemispheres) if side == "left"] or [np.nan])
+    right_alpha = np.nanmean([alpha_by_channel[i] for i, side in enumerate(hemispheres) if side == "right"] or [np.nan])
     output["eeg_alpha_asymmetry_log_right_left"] = float(np.log(right_alpha + 1e-12) - np.log(left_alpha + 1e-12))
     return output
 
@@ -145,6 +214,7 @@ class StreamingPhysioProcessor:
     ecg_columns: list[int]
     counter_column: int
     bands: dict[str, list[float]]
+    montage: EEGMontage
     eeg_disabled: bool = False
     strict_coverage_min: float = 0.60
     eeg_abs_uV_max: float = 350.0
@@ -168,7 +238,7 @@ class StreamingPhysioProcessor:
             coverage = eeg_quality_coverage(eeg, self.sample_rate, self.eeg_abs_uV_max, self.eeg_flat_std_uV_min)
             qc.update({"eeg_strict_coverage": coverage, "eeg_usable": coverage >= self.strict_coverage_min, "eeg_disabled_by_participant_qc": False})
             if qc["eeg_usable"]:
-                features.update(eeg_features(eeg, self.sample_rate, self.bands, self.car))
+                features.update(eeg_features(eeg, self.sample_rate, self.bands, self.montage, self.car))
         qc["physio_complete"] = len(values) >= int(expected * 0.98)
         return features, qc
 

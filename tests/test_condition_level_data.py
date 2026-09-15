@@ -57,7 +57,7 @@ def test_untrusted_ecg_hrv_features_are_excluded_from_model_columns():
         "ecg_rr_std_ms_audit_only",
         "ecg_rr_std_ms_audit_only__mean",
         "head_speed_mean",
-        "eeg_t7_alpha_relative",
+        "eeg_tp9_alpha_relative",
     ]
     assert columns_for_group(columns, "no_eeg") == [
         "ecg_hr_bpm",

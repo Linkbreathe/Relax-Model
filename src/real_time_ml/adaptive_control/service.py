@@ -14,7 +14,7 @@ import numpy as np
 from real_time_ml.config import ProjectConfig
 from real_time_ml.features.eye import eye_features
 from real_time_ml.features.head import head_features
-from real_time_ml.features.physio import StreamingPhysioProcessor
+from real_time_ml.features.physio import EEGMontage, StreamingPhysioProcessor
 from real_time_ml.realtime.cycle import TenSecondCycleClock, TimeBuffer
 from real_time_ml.utils import write_json, write_jsonl
 
@@ -39,6 +39,7 @@ def _make_processor(config: ProjectConfig, participant_id: str | None) -> Stream
         ecg_columns=list(config.get("streams.ecg_columns")),
         counter_column=int(config.get("streams.counter_column")),
         bands=dict(config.get("features.eeg.bands")),
+        montage=EEGMontage.from_config(config),
         eeg_disabled=participant_id in set(config.get("participants.eeg_disabled")),
         strict_coverage_min=float(config.get("quality.eeg_strict_coverage_min")),
         eeg_abs_uV_max=float(config.get("quality.eeg_abs_uV_max")),

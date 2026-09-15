@@ -497,7 +497,7 @@ def test_realtime_multimodal_feature_filter_excludes_condition_context():
         "intensity",
         "frequency",
         "presentation_position",
-        "eeg_t7_alpha_relative",
+        "eeg_tp9_alpha_relative",
         "ecg_hr_bpm",
         "eye_valid_fraction",
         "head_speed_mean",
@@ -509,7 +509,7 @@ def test_realtime_multimodal_feature_filter_excludes_condition_context():
 
     assert selected == [
         "ecg_hr_bpm",
-        "eeg_t7_alpha_relative",
+        "eeg_tp9_alpha_relative",
         "eye_valid_fraction",
         "head_speed_mean",
         "imu_accel_mean",
@@ -530,7 +530,7 @@ def _realtime_bundle(tmp_path):
             "frequency": 0.41,
             "presentation_position": index % 9 + 1,
             "sample_weight": 1.0,
-            "eeg_t7_alpha_relative": calm,
+            "eeg_tp9_alpha_relative": calm,
             "ecg_hr_bpm": 110.0 - calm * 30.0,
             "eye_valid_fraction": 0.8 + calm * 0.2,
             "head_speed_mean": 0.2 - calm * 0.1,
@@ -577,13 +577,13 @@ def test_realtime_multimodal_adapter_predicts_from_window_features(tmp_path):
     adapter.reset_session("session-1")
 
     low = adapter.predict_current({
-        "eeg_t7_alpha_relative": 0.0,
+        "eeg_tp9_alpha_relative": 0.0,
         "ecg_hr_bpm": 110.0,
         "eye_valid_fraction": 0.8,
         "head_speed_mean": 0.2,
     }, "C5", {"eeg": 1.0, "ecg": 1.0, "eye": 1.0, "head": 1.0})
     high = adapter.predict_current({
-        "eeg_t7_alpha_relative": 1.0,
+        "eeg_tp9_alpha_relative": 1.0,
         "ecg_hr_bpm": 80.0,
         "eye_valid_fraction": 1.0,
         "head_speed_mean": 0.1,
@@ -617,7 +617,7 @@ def test_realtime_multimodal_adapter_tolerates_missing_features(tmp_path):
     assert adapter.preflight(_profile(tmp_path)).compatible
     adapter.reset_session("session-1")
 
-    estimate = adapter.predict_current({"eeg_t7_alpha_relative": 0.5}, "C5", {"eeg": 1.0})
+    estimate = adapter.predict_current({"eeg_tp9_alpha_relative": 0.5}, "C5", {"eeg": 1.0})
 
     assert np.isfinite(estimate.relaxation)
     assert np.isfinite(estimate.discomfort)

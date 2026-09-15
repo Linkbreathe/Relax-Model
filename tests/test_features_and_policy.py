@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from real_time_ml.features.physio import StreamingPhysioProcessor, peak_f1
+from real_time_ml.features.physio import (
+    EEGMontage,
+    StreamingPhysioProcessor,
+    apply_reference,
+    eeg_features,
+    peak_f1,
+)
 from real_time_ml.modeling.train import predict_state
 from real_time_ml.policy.recommender import SafetyPolicy, adjacent_conditions
 
@@ -21,10 +27,19 @@ def synthetic_physio(sample_rate: float = 500.0) -> np.ndarray:
     return values
 
 
+TEST_MONTAGE = EEGMontage(
+    names=("M2", "TP9", "TP10", "M1"),
+    roles=("reference", "signal", "signal", "reference"),
+    hemispheres=("right", "left", "right", "left"),
+    reference_scheme="linked_mastoid",
+)
+
+
 def processor() -> StreamingPhysioProcessor:
     return StreamingPhysioProcessor(
         sample_rate=500.0, eeg_columns=[1, 2, 3, 4], ecg_columns=[7, 8], counter_column=0,
         bands={"delta": [1, 4], "theta": [4, 8], "alpha": [8, 13], "beta": [13, 30], "gamma": [30, 45]},
+        montage=TEST_MONTAGE,
     )
 
 
@@ -36,6 +51,51 @@ def test_offline_replay_and_realtime_window_features_are_identical():
     for name in offline:
         assert np.allclose(offline[name], realtime[name], equal_nan=True, rtol=1e-12, atol=1e-12)
     assert offline_qc == realtime_qc
+
+
+BANDS = {"delta": [1, 4], "theta": [4, 8], "alpha": [8, 13], "beta": [13, 30], "gamma": [30, 45]}
+
+
+def _four_channel_window(sample_rate: float, left_alpha_uV: float, right_alpha_uV: float) -> np.ndarray:
+    """Raw [M2, TP9, TP10, M1] window; TP9 (left) and TP10 (right) carry a 10 Hz alpha tone."""
+    time = np.arange(int(sample_rate * 10.0)) / sample_rate
+    tone = np.sin(2 * np.pi * 10.0 * time)
+    m2 = 5.0 * tone
+    m1 = 5.0 * tone
+    tp9 = left_alpha_uV * tone
+    tp10 = right_alpha_uV * tone
+    return np.column_stack([m2, tp9, tp10, m1])
+
+
+def test_eeg_features_only_expose_signal_channels():
+    values = _four_channel_window(500.0, 40.0, 40.0)
+    features = eeg_features(values, 500.0, BANDS, TEST_MONTAGE)
+    per_channel = {
+        key.split("_")[1]
+        for key in features
+        if key.startswith("eeg_") and key.endswith("_power")
+    }
+    assert per_channel == {"tp9", "tp10"}
+    assert not any("_m1_" in key or "_m2_" in key for key in features)
+
+
+def test_eeg_alpha_asymmetry_sign_follows_hemispheres():
+    # TP9 (left) strong alpha, TP10 (right) weak alpha -> log(right) - log(left) < 0.
+    features = eeg_features(_four_channel_window(500.0, 40.0, 8.0), 500.0, BANDS, TEST_MONTAGE)
+    assert features["eeg_alpha_asymmetry_log_right_left"] < 0.0
+    # Swap hemispheric dominance -> sign flips positive.
+    swapped = eeg_features(_four_channel_window(500.0, 8.0, 40.0), 500.0, BANDS, TEST_MONTAGE)
+    assert swapped["eeg_alpha_asymmetry_log_right_left"] > 0.0
+
+
+def test_linked_mastoid_reference_is_subtracted():
+    values = _four_channel_window(500.0, 40.0, 8.0)
+    referenced, names, hemispheres = apply_reference(values, TEST_MONTAGE)
+    assert names == ["tp9", "tp10"]
+    assert hemispheres == ["left", "right"]
+    reference = (values[:, 3] + values[:, 0]) / 2.0  # (M1 + M2) / 2
+    assert np.allclose(referenced[:, 0], values[:, 1] - reference)
+    assert np.allclose(referenced[:, 1], values[:, 2] - reference)
 
 
 def test_peak_f1_tolerance():

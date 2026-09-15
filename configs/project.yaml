@@ -1,7 +1,7 @@
 schema_version: "1.0.0"
 project_root: ".."
 paths:
-  raw_root: "C:/Users/linki/amaster/data_collection_v3"
+  raw_root: "C:/Users/linki/amaster/data_collection_v3/relaxdata"
   labels_root: "C:/Users/linki/Downloads/tables-20260621T182109Z-3-001/tables"
   artifacts: "../artifacts"
   cache: "../artifacts/cache"
@@ -29,7 +29,11 @@ streams:
   sample_rate_hz: 500.0
   counter_column: 0
   eeg_columns: [1, 2, 3, 4]
-  eeg_names: [T7, T8, TP7, TP8]
+  # True electrode identity per eeg_columns position (raw XDF carries only ch0-ch3).
+  # Physical order is [M2, TP9, TP10, M1] = [R, L, R, L]. M1/M2 are mastoid REFERENCE
+  # electrodes; the cortical signals are TP9 (left) and TP10 (right). See features.eeg
+  # below for how the reference is applied. Aligned index-for-index with eeg_columns.
+  eeg_names: [M2, TP9, TP10, M1]
   ecg_columns: [7, 8]
   ecg_bipolar: "ch6-ch7"
   raw_unit: uV
@@ -57,6 +61,16 @@ features:
   eeg:
     enabled: true
     common_average_reference: false
+    # Mastoid re-referencing. M1/M2 (see streams.eeg_names) are reference electrodes, not
+    # cortical signal. reference_scheme controls how the reference is formed and subtracted:
+    #   linked_mastoid      -> ref = mean(M1, M2); TP9_ref = TP9 - ref, TP10_ref = TP10 - ref
+    #   ipsilateral_mastoid -> TP9 - M1 (left), TP10 - M2 (right)
+    #   none                -> no re-reference (legacy behaviour; not recommended here)
+    # Only the 'signal' channels produce per-channel features. channel_roles /
+    # channel_hemispheres are aligned index-for-index with streams.eeg_columns / eeg_names.
+    reference_scheme: linked_mastoid
+    channel_roles: [reference, signal, signal, reference]
+    channel_hemispheres: [right, left, right, left]
     bandpass_hz: [1.0, 45.0]
     notch_hz: 50.0
     bands:

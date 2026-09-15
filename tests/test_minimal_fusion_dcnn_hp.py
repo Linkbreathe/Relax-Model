@@ -28,9 +28,9 @@ P_FEATURES = [
     "ecg_hr_bpm",
     "ecg_hrv_30s_rmssd_ms",
     "ecg_rr_std_ms_audit_only",
-    "eeg_t7_alpha_relative",
-    "eeg_t7_alpha_power",
-    "eeg_t7_hjorth_activity",
+    "eeg_tp9_alpha_relative",
+    "eeg_tp9_alpha_power",
+    "eeg_tp9_hjorth_activity",
     "eeg_alpha_beta_ratio",
 ]
 
