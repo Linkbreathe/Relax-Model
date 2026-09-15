@@ -6,7 +6,7 @@ Relax-Model connects recorded physiological signals, eye tracking, head motion, 
 
 This repository contains both research experiments and runtime implementations. Their presence demonstrates implemented workflows; it does not establish that a model generalizes to new users or that adaptive control improves relaxation.
 
-[Chinese overview](README_zh.md) · [Input contracts](data/contracts/input_tables.md) · [Label contract](data/contracts/labels.md) · [Unity Shadow protocol](integrations/unity/PROTOCOL.md)
+[Chinese overview](README_zh.md) · [Input contracts](data/contracts/input_tables.md) · [Label contract](data/contracts/labels.md) · [Unity Shadow protocol](integrations/unity/PROTOCOL.md) · [Auxiliary research notes](Auxiliary/research/)
 
 ## Research purpose
 
@@ -244,7 +244,7 @@ analysis/
   supplementary/                Comparisons, ablations, figures, and reports
 integrations/unity/              Shadow bridge and message protocol
 tests/                           Unit, integration, and slow tests
-plan/                            Research planning documents
+  Auxiliary/                       Research plans and historical review notes
 artifacts/                       Local generated outputs (mostly ignored)
 ```
 
